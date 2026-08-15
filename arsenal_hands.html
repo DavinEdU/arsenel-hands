@@ -1,0 +1,639 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Arsenal — Gesture-Summoned Weapons</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    width: 100%; height: 100%;
+    background: #05070a;
+    font-family: 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
+    overflow: hidden;
+    -webkit-user-select: none; user-select: none;
+  }
+  #stage { position: fixed; inset: 0; width: 100vw; height: 100vh; background: #000; }
+  video { display: none; }
+  canvas { position: absolute; top: 0; left: 0; width: 100vw; height: 100vh; display: block; }
+
+  #title {
+    position: absolute; top: max(18px, env(safe-area-inset-top)); left: 0; right: 0;
+    text-align: center; color: #eaf6ff; font-size: 15px; letter-spacing: 0.08em;
+    z-index: 5; text-shadow: 0 2px 10px rgba(0,0,0,0.85); pointer-events: none;
+    font-weight: 600;
+  }
+  #legend {
+    display: flex; justify-content: center; gap: 10px; margin-top: 8px;
+    flex-wrap: wrap; padding: 0 12px;
+  }
+  .pill {
+    font-size: 10px; letter-spacing: 0.04em; color: rgba(220,235,245,0.85);
+    background: rgba(20,30,45,0.55); border: 1px solid rgba(120,190,255,0.3);
+    padding: 4px 9px; border-radius: 20px; backdrop-filter: blur(4px);
+    text-transform: uppercase; font-weight: 500;
+  }
+
+  #startBtn {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    z-index: 10; padding: 16px 34px; background: rgba(10,15,25,0.5);
+    border: 1px solid rgba(140,200,255,0.55); color: #eaf6ff; font-family: inherit;
+    font-size: 13px; letter-spacing: 0.12em; text-transform: uppercase; cursor: pointer;
+    border-radius: 3px; backdrop-filter: blur(6px); transition: all 0.25s ease;
+    font-weight: 600;
+  }
+  #startBtn:hover { background: rgba(140,200,255,0.14); border-color: #b6e2ff; }
+  #loading {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    color: #b9d4e8; font-size: 12px; letter-spacing: 0.1em; z-index: 10; text-align: center;
+    max-width: 260px;
+  }
+  .hidden { display: none !important; }
+
+  .hudCard {
+    position: absolute; bottom: max(20px, env(safe-area-inset-bottom));
+    z-index: 5; min-width: 150px; padding: 10px 14px;
+    background: rgba(8,14,22,0.55); border: 1px solid rgba(140,200,255,0.28);
+    border-radius: 8px; backdrop-filter: blur(6px);
+    color: #eaf6ff; opacity: 0; transition: opacity 0.35s ease;
+    pointer-events: none;
+  }
+  .hudCard.show { opacity: 1; }
+  #hudLeft { left: max(16px, env(safe-area-inset-left)); }
+  #hudRight { right: max(16px, env(safe-area-inset-right)); text-align: right; }
+  .hudHand { font-size: 9px; letter-spacing: 0.14em; text-transform: uppercase; opacity: 0.55; margin-bottom: 3px; }
+  .hudWeapon { font-size: 14px; font-weight: 700; letter-spacing: 0.02em; }
+  .hudGesture { font-size: 10px; opacity: 0.7; margin-top: 2px; text-transform: capitalize; }
+</style>
+</head>
+<body>
+
+<div id="stage">
+  <video id="input_video" playsinline muted></video>
+  <canvas id="output_canvas"></canvas>
+
+  <div id="title">ARSENAL
+    <div id="legend">
+      <span class="pill">✊ Fist → Hammer</span>
+      <span class="pill">✋ Palm → Shield</span>
+      <span class="pill">☝️ Point → Blaster</span>
+      <span class="pill">✌️ Peace → Blades</span>
+      <span class="pill">〰️ Shake → Cycle</span>
+    </div>
+  </div>
+
+  <div id="hudLeft" class="hudCard">
+    <div class="hudHand">Left Hand</div>
+    <div class="hudWeapon" id="hudLeftWeapon">—</div>
+    <div class="hudGesture" id="hudLeftGesture"></div>
+  </div>
+  <div id="hudRight" class="hudCard">
+    <div class="hudHand">Right Hand</div>
+    <div class="hudWeapon" id="hudRightWeapon">—</div>
+    <div class="hudGesture" id="hudRightGesture"></div>
+  </div>
+
+  <button id="startBtn">Begin</button>
+  <div id="loading" class="hidden">loading tracking model…</div>
+</div>
+
+<script type="module">
+import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+const videoElement = document.getElementById('input_video');
+const canvasElement = document.getElementById('output_canvas');
+const ctx = canvasElement.getContext('2d');
+const startBtn = document.getElementById('startBtn');
+const loadingEl = document.getElementById('loading');
+const hudEls = {
+  Left:  { card: document.getElementById('hudLeft'),  weapon: document.getElementById('hudLeftWeapon'),  gesture: document.getElementById('hudLeftGesture') },
+  Right: { card: document.getElementById('hudRight'), weapon: document.getElementById('hudRightWeapon'), gesture: document.getElementById('hudRightGesture') },
+};
+
+// ---------- One Euro Filter (position smoothing) ----------
+class LowPassFilter {
+  constructor(alpha) { this.setAlpha(alpha); this.y = null; this.s = null; }
+  setAlpha(alpha) { this.a = alpha; }
+  filter(value) {
+    let result;
+    if (this.y === null) result = value;
+    else result = this.a * value + (1 - this.a) * this.s;
+    this.y = value; this.s = result;
+    return result;
+  }
+}
+class OneEuroFilter {
+  constructor(freq = 30, mincutoff = 1.0, beta = 0.4, dcutoff = 1.0) {
+    this.freq = freq; this.mincutoff = mincutoff; this.beta = beta; this.dcutoff = dcutoff;
+    this.x = new LowPassFilter(this.alpha(mincutoff));
+    this.dx = new LowPassFilter(this.alpha(dcutoff));
+  }
+  alpha(cutoff) {
+    const te = 1.0 / this.freq;
+    const tau = 1.0 / (2 * Math.PI * cutoff);
+    return 1.0 / (1.0 + tau / te);
+  }
+  filter(value) {
+    const prevY = this.x.y;
+    const dvalue = prevY === null ? 0 : (value - prevY) * this.freq;
+    const edvalue = this.dx.filter(dvalue);
+    const cutoff = this.mincutoff + this.beta * Math.abs(edvalue);
+    this.x.setAlpha(this.alpha(cutoff));
+    return this.x.filter(value);
+  }
+}
+function makePointFilter(mincutoff = 1.1, beta = 0.5) {
+  return { fx: new OneEuroFilter(30, mincutoff, beta), fy: new OneEuroFilter(30, mincutoff, beta) };
+}
+function filterPoint(pf, x, y) { return { x: pf.fx.filter(x), y: pf.fy.filter(y) }; }
+
+function clamp01(v) { return Math.max(0, Math.min(1, v)); }
+function lerp(a, b, t) { return a + (b - a) * t; }
+
+// ---------- canvas resize ----------
+function resizeCanvas() { canvasElement.width = window.innerWidth; canvasElement.height = window.innerHeight; }
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+
+// ---------- video cover-fit mapping ----------
+let coverInfo = null;
+function computeCover(vidW, vidH, canW, canH) {
+  const scale = Math.max(canW / vidW, canH / vidH);
+  const drawW = vidW * scale, drawH = vidH * scale;
+  return { drawW, drawH, offsetX: (canW - drawW) / 2, offsetY: (canH - drawH) / 2 };
+}
+// returns canvas coords already mirrored to match the mirrored video draw
+function mapLandmark(nx, ny, canW) {
+  const px = coverInfo.offsetX + nx * coverInfo.drawW;
+  const py = coverInfo.offsetY + ny * coverInfo.drawH;
+  return { x: canW - px, y: py };
+}
+
+// =====================================================================
+// GESTURE CLASSIFICATION  (runs on RAW landmarks — instant, no smoothing lag)
+// =====================================================================
+function isFingerExtended(lm, mcp, pip, tip, straightDeg) {
+  const v1x = lm[pip].x - lm[mcp].x, v1y = lm[pip].y - lm[mcp].y;
+  const v2x = lm[tip].x - lm[pip].x, v2y = lm[tip].y - lm[pip].y;
+  const m1 = Math.hypot(v1x, v1y) || 1e-6, m2 = Math.hypot(v2x, v2y) || 1e-6;
+  const cos = Math.max(-1, Math.min(1, (v1x * v2x + v1y * v2y) / (m1 * m2)));
+  return (Math.acos(cos) * 180 / Math.PI) < straightDeg;
+}
+function classifyGesture(lm) {
+  const idx   = isFingerExtended(lm, 5, 6, 8, 42);
+  const mid   = isFingerExtended(lm, 9, 10, 12, 42);
+  const ring  = isFingerExtended(lm, 13, 14, 16, 42);
+  const pinky = isFingerExtended(lm, 17, 18, 20, 42);
+  const count = [idx, mid, ring, pinky].filter(Boolean).length;
+  if (count === 0) return 'fist';
+  if (count === 4) return 'palm';
+  if (idx && !mid && !ring && !pinky) return 'point';
+  if (idx && mid && !ring && !pinky) return 'peace';
+  return 'neutral';
+}
+
+const GESTURE_WEAPON = { fist: 'hammer', palm: 'shield', point: 'blaster', peace: 'blades' };
+const GESTURE_LABEL  = { fist: 'fist', palm: 'open palm', point: 'pointing', peace: 'peace sign', neutral: '' };
+const WEAPON_CYCLE   = ['hammer', 'shield', 'blaster', 'blades', 'whip'];
+const WEAPON_NAMES   = { hammer: 'Storm Hammer', shield: 'Aegis Shield', blaster: 'Photon Blaster', blades: 'Twin Blades', whip: 'Plasma Whip' };
+
+// =====================================================================
+// PARTICLE BURSTS
+// =====================================================================
+let particles = [];
+function spawnBurst(x, y, color, count = 20, speed = 3.2) {
+  for (let i = 0; i < count; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const sp = 0.6 + Math.random() * speed;
+    particles.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: 1, decay: 0.018 + Math.random() * 0.02, color, size: 1.5 + Math.random() * 2.6 });
+  }
+  if (particles.length > 500) particles.splice(0, particles.length - 500);
+}
+function updateDrawParticles() {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx; p.y += p.vy; p.vx *= 0.95; p.vy *= 0.95; p.life -= p.decay;
+    if (p.life <= 0) { particles.splice(i, 1); continue; }
+    ctx.save();
+    ctx.globalAlpha = Math.max(0, p.life);
+    ctx.fillStyle = p.color;
+    ctx.shadowColor = p.color; ctx.shadowBlur = 9;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  }
+}
+
+// =====================================================================
+// WEAPON RENDERERS  (drawn along local -y axis, caller rotates to hand direction)
+// =====================================================================
+function roundedRect(x, y, w, h, r) {
+  if (ctx.roundRect) { ctx.beginPath(); ctx.roundRect(x, y, w, h, r); }
+  else { ctx.beginPath(); ctx.rect(x, y, w, h); }
+}
+
+function drawHammer(x, y, angle, s, charge) {
+  ctx.save(); ctx.translate(x, y); ctx.rotate(angle);
+  const handleLen = 68 * s;
+  const hg = ctx.createLinearGradient(0, 8 * s, 0, -handleLen);
+  hg.addColorStop(0, 'rgba(80,62,45,0.95)');
+  hg.addColorStop(1, 'rgba(190,160,120,0.95)');
+  ctx.strokeStyle = hg; ctx.lineWidth = 6.5 * s; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(0, 8 * s); ctx.lineTo(0, -handleLen); ctx.stroke();
+
+  ctx.save();
+  ctx.translate(0, -handleLen);
+  const headW = 46 * s, headH = 26 * s;
+  ctx.shadowColor = `rgba(140,200,255,${0.45 + 0.5 * charge})`;
+  ctx.shadowBlur = 16 * s * (0.6 + charge);
+  const fill = ctx.createLinearGradient(-headW / 2, 0, headW / 2, 0);
+  fill.addColorStop(0, 'rgba(110,165,220,0.95)');
+  fill.addColorStop(0.5, 'rgba(225,242,255,0.98)');
+  fill.addColorStop(1, 'rgba(110,165,220,0.95)');
+  ctx.fillStyle = fill;
+  roundedRect(-headW / 2, -headH / 2, headW, headH, 4 * s); ctx.fill();
+  ctx.strokeStyle = 'rgba(190,225,255,0.9)'; ctx.lineWidth = 2 * s; ctx.stroke();
+  ctx.strokeStyle = `rgba(255,255,255,${0.45 + 0.5 * charge})`; ctx.lineWidth = 1.1 * s;
+  ctx.beginPath();
+  ctx.moveTo(-headW * 0.3, -headH * 0.18); ctx.lineTo(0, headH * 0.12); ctx.lineTo(headW * 0.26, -headH * 0.14);
+  ctx.stroke();
+  ctx.restore();
+  ctx.restore();
+}
+
+function drawShield(x, y, angle, s, charge) {
+  ctx.save(); ctx.translate(x, y); ctx.rotate(angle);
+  const r = 40 * s;
+  ctx.shadowColor = `rgba(255,190,120,${0.35 + 0.5 * charge})`;
+  ctx.shadowBlur = 15 * s * (0.6 + charge);
+  const g = ctx.createRadialGradient(0, 0, r * 0.1, 0, 0, r);
+  g.addColorStop(0, 'rgba(230,85,60,0.95)');
+  g.addColorStop(0.55, 'rgba(190,42,42,0.95)');
+  g.addColorStop(1, 'rgba(115,20,25,0.95)');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,225,190,0.9)'; ctx.lineWidth = 3 * s; ctx.stroke();
+  ctx.beginPath(); ctx.arc(0, 0, r * 0.62, 0, Math.PI * 2);
+  ctx.strokeStyle = 'rgba(255,225,190,0.65)'; ctx.lineWidth = 1.8 * s; ctx.stroke();
+  ctx.beginPath();
+  for (let i = 0; i < 5; i++) {
+    const a = -Math.PI / 2 + i * (Math.PI * 2 / 5);
+    const px = Math.cos(a) * r * 0.32, py = Math.sin(a) * r * 0.32;
+    i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+    const a2 = a + Math.PI / 5;
+    ctx.lineTo(Math.cos(a2) * r * 0.14, Math.sin(a2) * r * 0.14);
+  }
+  ctx.closePath();
+  ctx.fillStyle = 'rgba(255,235,210,0.95)'; ctx.fill();
+  ctx.restore();
+}
+
+function drawBlaster(x, y, angle, s, charge) {
+  ctx.save(); ctx.translate(x, y); ctx.rotate(angle);
+  ctx.fillStyle = 'rgba(58,64,74,0.95)';
+  roundedRect(-15 * s, -10 * s, 30 * s, 38 * s, 6 * s); ctx.fill();
+  ctx.strokeStyle = 'rgba(150,220,255,0.8)'; ctx.lineWidth = 2 * s; ctx.stroke();
+
+  const barrelLen = 38 * s * (0.9 + 0.35 * charge);
+  ctx.save(); ctx.translate(0, -10 * s);
+  const bg = ctx.createLinearGradient(0, 0, 0, -barrelLen);
+  bg.addColorStop(0, 'rgba(80,90,100,0.95)');
+  bg.addColorStop(1, 'rgba(150,220,255,0.95)');
+  ctx.strokeStyle = bg; ctx.lineWidth = 9.5 * s; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, -barrelLen); ctx.stroke();
+
+  ctx.shadowColor = `rgba(140,220,255,${0.55 + 0.45 * charge})`;
+  ctx.shadowBlur = 18 * s * (0.5 + charge);
+  ctx.fillStyle = `rgba(200,240,255,${0.7 + 0.3 * charge})`;
+  ctx.beginPath(); ctx.arc(0, -barrelLen, 5.5 * s * (0.7 + 0.6 * charge), 0, Math.PI * 2); ctx.fill();
+
+  if (charge > 0.55) {
+    ctx.strokeStyle = `rgba(180,235,255,${(charge - 0.5) * 1.4})`;
+    ctx.lineWidth = 3.6 * s;
+    ctx.beginPath(); ctx.moveTo(0, -barrelLen); ctx.lineTo(0, -barrelLen - 85 * s * charge); ctx.stroke();
+  }
+  ctx.restore();
+  ctx.restore();
+}
+
+function drawBlades(x, y, angle, s, charge) {
+  ctx.save(); ctx.translate(x, y); ctx.rotate(angle);
+  [-1, 1].forEach((side) => {
+    ctx.save(); ctx.rotate(side * 0.26);
+    const len = 56 * s * (0.9 + 0.3 * charge);
+    ctx.shadowColor = `rgba(150,255,210,${0.45 + 0.45 * charge})`;
+    ctx.shadowBlur = 13 * s;
+    const g = ctx.createLinearGradient(0, 0, 0, -len);
+    g.addColorStop(0, 'rgba(20,60,50,0.15)');
+    g.addColorStop(1, 'rgba(185,255,225,0.95)');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.moveTo(-3.5 * s, 0);
+    ctx.quadraticCurveTo(-6 * s, -len * 0.5, 0, -len);
+    ctx.quadraticCurveTo(6 * s, -len * 0.5, 3.5 * s, 0);
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  });
+  ctx.restore();
+}
+
+function drawWhip(x, y, angle, s, charge, trail) {
+  ctx.save();
+  if (trail && trail.length > 1) {
+    ctx.strokeStyle = 'rgba(205,165,255,0.85)';
+    ctx.lineWidth = 4 * s; ctx.lineCap = 'round';
+    ctx.shadowColor = 'rgba(205,165,255,0.7)'; ctx.shadowBlur = 12 * s;
+    ctx.beginPath();
+    trail.forEach((p, i) => { i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y); });
+    ctx.stroke();
+    const tip = trail[0];
+    ctx.fillStyle = 'rgba(232,205,255,0.95)';
+    ctx.beginPath(); ctx.arc(tip.x, tip.y, 7 * s * (0.8 + 0.4 * charge), 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.fillStyle = 'rgba(212,182,255,0.9)';
+  ctx.shadowColor = 'rgba(205,165,255,0.7)'; ctx.shadowBlur = 10 * s;
+  ctx.beginPath(); ctx.arc(x, y, 6 * s, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+}
+
+const WEAPON_COLOR = { hammer: 'rgba(160,210,255,0.9)', shield: 'rgba(255,170,120,0.9)', blaster: 'rgba(160,225,255,0.9)', blades: 'rgba(160,255,215,0.9)', whip: 'rgba(215,175,255,0.9)' };
+
+function renderWeapon(slot, x, y, angle, s, now, alpha) {
+  const charge = slot.flashUntil > now ? clamp01((slot.flashUntil - now) / 420) : 0.12 + 0.12 * Math.sin(now / 480 + (slot.hand === 'Left' ? 0 : 2.4));
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  switch (slot.weapon) {
+    case 'hammer':  drawHammer(x, y, angle, s, charge); break;
+    case 'shield':  drawShield(x, y, angle, s, charge); break;
+    case 'blaster': drawBlaster(x, y, angle, s, charge); break;
+    case 'blades':  drawBlades(x, y, angle, s, charge); break;
+    case 'whip':    drawWhip(x, y, angle, s, charge, slot.trail); break;
+  }
+  ctx.restore();
+}
+
+// small anchor glow marker on wrist
+function drawAnchor(x, y, s, alpha) {
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = 'rgba(150,200,255,0.55)';
+  ctx.shadowColor = 'rgba(150,200,255,0.6)'; ctx.shadowBlur = 6 * s;
+  ctx.beginPath(); ctx.arc(x, y, 3.2 * s, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+}
+
+// =====================================================================
+// HAND SLOTS  (independent state per physical hand — no fixed L/R role)
+// =====================================================================
+function newSlot(hand) {
+  return {
+    hand,
+    active: false,
+    lastSeen: 0,
+    filters: { wrist: makePointFilter(1.1, 0.55), mcp: makePointFilter(1.1, 0.55) },
+    angleSin: new OneEuroFilter(30, 1.2, 0.35),
+    angleCos: new OneEuroFilter(30, 1.2, 0.35),
+    handSizeFilt: new OneEuroFilter(30, 1.0, 0.3),
+    weapon: hand === 'Left' ? 'shield' : 'hammer',
+    gestureBuf: [],
+    lastSwitch: 0,
+    wristHistRaw: [],
+    shakeCooldownUntil: 0,
+    flashUntil: 0,
+    trail: [],
+  };
+}
+const slots = { Left: newSlot('Left'), Right: newSlot('Right') };
+
+function majorityGesture(buf) {
+  const counts = {};
+  buf.forEach((g) => { counts[g] = (counts[g] || 0) + 1; });
+  let best = null, bestC = 0;
+  for (const k in counts) { if (counts[k] > bestC) { best = k; bestC = counts[k]; } }
+  return { gesture: best, count: bestC };
+}
+
+function updateShake(slot, rawWristX, rawWristY, now) {
+  slot.wristHistRaw.push({ x: rawWristX, y: rawWristY, t: now });
+  const cutoff = now - 350;
+  while (slot.wristHistRaw.length && slot.wristHistRaw[0].t < cutoff) slot.wristHistRaw.shift();
+  const h = slot.wristHistRaw;
+  if (h.length < 6) return false;
+
+  let flips = 0, totalDist = 0, prevSign = 0;
+  for (let i = 1; i < h.length; i++) {
+    const dx = h[i].x - h[i - 1].x;
+    totalDist += Math.abs(dx);
+    const sign = dx > 0.004 ? 1 : dx < -0.004 ? -1 : 0;
+    if (sign !== 0 && prevSign !== 0 && sign !== prevSign) flips++;
+    if (sign !== 0) prevSign = sign;
+  }
+  if (flips >= 4 && totalDist > 0.22 && now > slot.shakeCooldownUntil) {
+    slot.shakeCooldownUntil = now + 900;
+    slot.wristHistRaw = [];
+    return true;
+  }
+  return false;
+}
+
+function updateHud(slot) {
+  const el = hudEls[slot.hand];
+  if (!el) return;
+  if (slot.active) {
+    el.card.classList.add('show');
+    el.weapon.textContent = WEAPON_NAMES[slot.weapon];
+    const majority = majorityGesture(slot.gestureBuf.slice(-6));
+    el.gesture.textContent = GESTURE_LABEL[majority.gesture] || '';
+  } else {
+    el.card.classList.remove('show');
+  }
+}
+
+function processHand(lm, handedness, w, h, scaleF, now) {
+  const hand = handedness; // 'Left' | 'Right'
+  const slot = slots[hand];
+  if (!slot) return;
+
+  slot.active = true;
+  slot.lastSeen = now;
+
+  // ---- gesture (raw landmarks, instant) ----
+  const gesture = classifyGesture(lm);
+  slot.gestureBuf.push(gesture);
+  if (slot.gestureBuf.length > 10) slot.gestureBuf.shift();
+  const majority = majorityGesture(slot.gestureBuf);
+  if (
+    majority.gesture && majority.gesture !== 'neutral' &&
+    majority.count >= 7 &&
+    GESTURE_WEAPON[majority.gesture] &&
+    slot.weapon !== GESTURE_WEAPON[majority.gesture] &&
+    now - slot.lastSwitch > 260
+  ) {
+    slot.weapon = GESTURE_WEAPON[majority.gesture];
+    slot.lastSwitch = now;
+    slot.flashUntil = now + 420;
+  }
+
+  // ---- shake detection (raw normalized wrist coords) ----
+  const shakeTriggered = updateShake(slot, lm[0].x, lm[0].y, now);
+  if (shakeTriggered) {
+    const idx = (WEAPON_CYCLE.indexOf(slot.weapon) + 1) % WEAPON_CYCLE.length;
+    slot.weapon = WEAPON_CYCLE[idx];
+    slot.lastSwitch = now;
+    slot.flashUntil = now + 520;
+    slot.gestureBuf = [];
+  }
+
+  // ---- smoothed anchor + orientation ----
+  const wristMapped = mapLandmark(lm[0].x, lm[0].y, w);
+  const mcpMapped = mapLandmark(lm[9].x, lm[9].y, w);
+  const wristF = filterPoint(slot.filters.wrist, wristMapped.x, wristMapped.y);
+  const mcpF = filterPoint(slot.filters.mcp, mcpMapped.x, mcpMapped.y);
+
+  const dx = mcpF.x - wristF.x, dy = mcpF.y - wristF.y;
+  const rawAngle = Math.atan2(dy, dx) + Math.PI / 2;
+  const sinF = slot.angleSin.filter(Math.sin(rawAngle));
+  const cosF = slot.angleCos.filter(Math.cos(rawAngle));
+  const angle = Math.atan2(sinF, cosF);
+
+  const handSizeRaw = Math.hypot(dx, dy) || 1;
+  const handSize = slot.handSizeFilt.filter(handSizeRaw);
+  const sizeMul = clamp01((handSize / (72 * scaleF)) * 0.9 + 0.15) * 1.4 + 0.5;
+
+  const gripX = lerp(wristF.x, mcpF.x, 0.3);
+  const gripY = lerp(wristF.y, mcpF.y, 0.3);
+
+  slot.trail.unshift({ x: gripX, y: gripY });
+  if (slot.trail.length > 14) slot.trail.pop();
+
+  // ---- burst effect on any weapon switch this frame ----
+  if (slot.flashUntil === now + 420 || slot.flashUntil === now + 520) {
+    spawnBurst(gripX, gripY, WEAPON_COLOR[slot.weapon], shakeTriggered ? 26 : 16, shakeTriggered ? 4 : 2.6);
+  }
+
+  slot._render = { x: gripX, y: gripY, angle, s: scaleF * sizeMul };
+  updateHud(slot);
+}
+
+function fadeOutSlot(slot, now) {
+  if (!slot.active) return;
+  if (now - slot.lastSeen > 260) {
+    slot.active = false;
+    slot.gestureBuf = [];
+    updateHud(slot);
+  }
+}
+
+function drawSlot(slot, now) {
+  if (!slot._render) return;
+  const sinceSeen = now - slot.lastSeen;
+  if (sinceSeen > 260) return;
+  const alpha = sinceSeen < 40 ? 1 : clamp01(1 - (sinceSeen - 40) / 220);
+  const { x, y, angle, s } = slot._render;
+  drawAnchor(x, y, s, alpha * 0.7);
+  renderWeapon(slot, x, y, angle, s, now, alpha);
+}
+
+// =====================================================================
+// MAIN LOOP
+// =====================================================================
+let handLandmarker = null;
+let running = false;
+
+function onResults(result, now) {
+  const w = canvasElement.width, h = canvasElement.height;
+  const scaleF = Math.max(0.8, Math.min(w, h) / 480);
+
+  ctx.clearRect(0, 0, w, h);
+
+  const vidW = videoElement.videoWidth, vidH = videoElement.videoHeight;
+  if (!vidW || !vidH) return;
+  coverInfo = computeCover(vidW, vidH, w, h);
+
+  ctx.save();
+  ctx.translate(w, 0);
+  ctx.scale(-1, 1);
+  ctx.drawImage(videoElement, coverInfo.offsetX, coverInfo.offsetY, coverInfo.drawW, coverInfo.drawH);
+  ctx.restore();
+
+  const seenThisFrame = { Left: false, Right: false };
+
+  if (result && result.landmarks && result.handedness) {
+    result.landmarks.forEach((lm, i) => {
+      const cat = result.handedness[i] && result.handedness[i][0];
+      if (!cat) return;
+      const hand = cat.categoryName === 'Left' ? 'Left' : 'Right';
+      seenThisFrame[hand] = true;
+      processHand(lm, hand, w, h, scaleF, now);
+    });
+  }
+
+  ['Left', 'Right'].forEach((hand) => {
+    if (!seenThisFrame[hand]) fadeOutSlot(slots[hand], now);
+    drawSlot(slots[hand], now);
+  });
+
+  updateDrawParticles();
+}
+
+function loop() {
+  if (!running) return;
+  const now = performance.now();
+  if (handLandmarker && videoElement.readyState >= 2) {
+    try {
+      const result = handLandmarker.detectForVideo(videoElement, now);
+      onResults(result, now);
+    } catch (e) {
+      // occasional transient decode errors — skip this frame
+    }
+  }
+  requestAnimationFrame(loop);
+}
+
+async function start() {
+  startBtn.classList.add('hidden');
+  loadingEl.classList.remove('hidden');
+  loadingEl.textContent = 'loading tracking model…';
+  resizeCanvas();
+
+  try {
+    const vision = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+    );
+    handLandmarker = await HandLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+        delegate: "GPU"
+      },
+      runningMode: "VIDEO",
+      numHands: 2,
+      minHandDetectionConfidence: 0.6,
+      minHandPresenceConfidence: 0.6,
+      minTrackingConfidence: 0.6
+    });
+  } catch (err) {
+    loadingEl.textContent = 'could not load tracking model — check connection';
+    console.error(err);
+    return;
+  }
+
+  try {
+    loadingEl.textContent = 'requesting camera…';
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 960 } },
+      audio: false
+    });
+    videoElement.srcObject = stream;
+    await videoElement.play();
+    loadingEl.classList.add('hidden');
+    running = true;
+    requestAnimationFrame(loop);
+  } catch (err) {
+    loadingEl.textContent = 'camera access denied or unavailable';
+    console.error(err);
+  }
+}
+
+startBtn.addEventListener('click', start);
+</script>
+</body>
+</html>
